@@ -47,7 +47,7 @@ USE_FULL_KERNEL = True  # if True, use explicit kernel solve, otherwise use CG
 # Select NTK mode: 'bias' or 'full'
 # NTK_MODE = 'bias'  # change to 'full' to run the full-NTK solution
 NTK_MODE = 'bias'  # change to 'full' to run the full-NTK solution
-PLOT_FIGS = True  # if True, plot figures
+PLOT_FIGS = False  # if True, plot figures
 
 # Device detection: CUDA > MPS > CPU
 if torch.cuda.is_available():
@@ -231,6 +231,40 @@ def full_ntk_update(x_train, y_train, x_test, y_test, model, epsilon=1e-6):
     return train_acc_lin, test_acc_lin, delta_theta
 
 
+# === Helper: Evaluate NTK on a single dataset split ===
+def evaluate_ntk_dataset(x_data, y_data, model, delta, mode):
+    """
+    Evaluate a model+delta on a single dataset split.
+    mode: 'bias' or 'full'
+    Returns accuracy (float).
+    """
+    P_ds = x_data.size(0)
+    C = y_data.max().item() + 1
+    out_init, h_init = model(x_data)
+    if mode == 'full':
+        # Full-NTK evaluation
+        mask = (h_init > 0).to(x_data.dtype)
+        temp = mask.unsqueeze(1) * model.W2.unsqueeze(0)
+        x_flat = x_data.view(P_ds, -1)
+        # build full Jacobian pieces
+        Jw1 = (temp.unsqueeze(-1) * x_flat.unsqueeze(1).unsqueeze(1)).reshape(P_ds*C, N_HIDDEN*INPUT_DIM)
+        Jb1 = temp.reshape(P_ds*C, N_HIDDEN)
+        Jw2 = h_init.unsqueeze(1).expand(P_ds, C, N_HIDDEN).reshape(P_ds*C, N_HIDDEN)
+        Jb2 = torch.eye(C, device=device).unsqueeze(0).expand(P_ds, -1, -1).reshape(P_ds*C, C)
+        J = torch.cat([Jw1, Jb1, Jw2, Jb2], dim=1)
+    else:
+        # Bias-only NTK evaluation
+        mask = (h_init > 0).to(x_data.dtype)
+        Jb1 = mask.unsqueeze(1) * model.W2.unsqueeze(0)
+        Jb2 = torch.eye(C, device=device).unsqueeze(0).expand(P_ds, -1, -1)
+        J = torch.cat([Jb1, Jb2], dim=2).reshape(P_ds*C, N_HIDDEN+C)
+    # linearized prediction
+    lin_flat = out_init.reshape(-1) + (J @ delta)
+    out_lin = lin_flat.view(P_ds, C)
+    acc = (out_lin.argmax(dim=1) == y_data).float().mean().item()
+    return acc
+
+
 # === Multi‐Dataset Loading & Subsampling ===
 transform = transforms.Compose([
     transforms.Resize((INPUT1, INPUT1)),
@@ -370,50 +404,9 @@ print(f"{mode_name} combined test  acc: {test_lin*100:.2f}%")
 for (x_tr, y_tr), (x_te, y_te), name in zip(train_sets, test_sets, names):
     x_tr, y_tr = x_tr.to(device), y_tr.to(device)
     x_te, y_te = x_te.to(device), y_te.to(device)
-    P_tr = x_tr.size(0)
-    P_te = x_te.size(0)
-    with torch.no_grad():
-        out_tr_init, h_tr_init = model(x_tr)
-        out_te_init, h_te_init = model(x_te)
-    # Build dataset‐specific Jacobian & apply same delta
-    if NTK_MODE == 'full':
-        # Full-NTK per-dataset
-        # Construct J_full_tr exactly as in full_ntk_update for train set
-        mask_tr = (h_tr_init > 0).to(x_tr.dtype)
-        temp_tr = mask_tr.unsqueeze(1) * model.W2.unsqueeze(0)
-        x_tr_flat = x_tr.view(P_tr, -1)
-        Jw1_tr = (temp_tr.unsqueeze(-1) * x_tr_flat.unsqueeze(1).unsqueeze(1)).reshape(P_tr*C, N_HIDDEN*INPUT_DIM)
-        Jb1_tr = temp_tr.reshape(P_tr*C, N_HIDDEN)
-        Jw2_tr = h_tr_init.unsqueeze(1).expand(P_tr, C, N_HIDDEN).reshape(P_tr*C, N_HIDDEN)
-        Jb2_tr = torch.eye(C, device=device).unsqueeze(0).expand(P_tr, -1, -1).reshape(P_tr*C, C)
-        J_tr = torch.cat([Jw1_tr, Jb1_tr, Jw2_tr, Jb2_tr], dim=1)
-        out_tr_lin = (out_tr_init.reshape(-1) + (J_tr @ delta)).view(P_tr, C)
-        train_acc_ds = (out_tr_lin.argmax(dim=1) == y_tr).float().mean().item()
-        # Same for test
-        mask_te = (h_te_init > 0).to(x_te.dtype)
-        temp_te = mask_te.unsqueeze(1) * model.W2.unsqueeze(0)
-        x_te_flat = x_te.view(P_te, -1)
-        Jw1_te = (temp_te.unsqueeze(-1) * x_te_flat.unsqueeze(1).unsqueeze(1)).reshape(P_te*C, N_HIDDEN*INPUT_DIM)
-        Jb1_te = temp_te.reshape(P_te*C, N_HIDDEN)
-        Jw2_te = h_te_init.unsqueeze(1).expand(P_te, C, N_HIDDEN).reshape(P_te*C, N_HIDDEN)
-        Jb2_te = torch.eye(C, device=device).unsqueeze(0).expand(P_te, -1, -1).reshape(P_te*C, C)
-        J_te = torch.cat([Jw1_te, Jb1_te, Jw2_te, Jb2_te], dim=1)
-        out_te_lin = (out_te_init.reshape(-1) + (J_te @ delta)).view(P_te, C)
-        test_acc_ds = (out_te_lin.argmax(dim=1) == y_te).float().mean().item()
-    else:
-        # Bias-only per-dataset
-        mask_tr = (h_tr_init > 0).to(x_tr.dtype)
-        Jb1_tr = mask_tr.unsqueeze(1) * model.W2.unsqueeze(0)
-        Jb2_tr = torch.eye(C, device=device).unsqueeze(0).expand(P_tr, -1, -1)
-        J_tr = torch.cat([Jb1_tr, Jb2_tr], dim=2).reshape(P_tr*C, N_HIDDEN+C)
-        out_tr_lin = (out_tr_init.reshape(-1) + (J_tr @ delta)).view(P_tr, C)
-        train_acc_ds = (out_tr_lin.argmax(dim=1) == y_tr).float().mean().item()
-        mask_te = (h_te_init > 0).to(x_te.dtype)
-        Jb1_te = mask_te.unsqueeze(1) * model.W2.unsqueeze(0)
-        Jb2_te = torch.eye(C, device=device).unsqueeze(0).expand(P_te, -1, -1)
-        J_te = torch.cat([Jb1_te, Jb2_te], dim=2).reshape(P_te*C, N_HIDDEN+C)
-        out_te_lin = (out_te_init.reshape(-1) + (J_te @ delta)).view(P_te, C)
-        test_acc_ds = (out_te_lin.argmax(dim=1) == y_te).float().mean().item()
+    # Evaluate on this dataset
+    train_acc_ds = evaluate_ntk_dataset(x_tr, y_tr, model, delta, NTK_MODE)
+    test_acc_ds  = evaluate_ntk_dataset(x_te, y_te, model, delta, NTK_MODE)
     print(f"{name}: train acc {train_acc_ds*100:.2f}%, test acc {test_acc_ds*100:.2f}%")
 
 # === Timing ===
